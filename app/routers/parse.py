@@ -151,6 +151,7 @@ async def _process_single_page(
             logger.info("LLM-corrected markdown saved to: %s", corrected_path)
 
     struct_tables = ocr_result["structure"].get("tables", [])
+    text_blocks = ocr_result["structure"].get("text_blocks", [])
 
     yield {
         "_page_result": {
@@ -158,6 +159,7 @@ async def _process_single_page(
             "vlm_md": vlm_md,
             "corrected_md": corrected_md,
             "struct_tables": struct_tables,
+            "text_blocks": text_blocks,
             "ocr_elapsed_s": ocr_result["elapsed_s"],
         }
     }
@@ -211,6 +213,7 @@ async def _parse_sse_generator(
     all_vlm_md: list[str] = []
     all_corrected_md: list[str] = []
     all_struct_tables: list[list[Any]] = []
+    all_text_blocks: list[list[dict]] = []
     last_ocr_elapsed = 0.0
 
     for idx, page_idx in enumerate(pages_to_process):
@@ -228,6 +231,7 @@ async def _parse_sse_generator(
                 all_vlm_md.append(pr["vlm_md"])
                 all_corrected_md.append(pr["corrected_md"])
                 all_struct_tables.append(pr["struct_tables"])
+                all_text_blocks.append(pr["text_blocks"])
                 last_ocr_elapsed = pr["ocr_elapsed_s"]
             else:
                 yield event  # type: ignore[misc]
@@ -237,7 +241,8 @@ async def _parse_sse_generator(
 
     combined_corrected = "\n\n".join(filter(None, all_corrected_md))
     combined_struct_tables = [t for tables in all_struct_tables for t in tables]
-    rendered_html = _render_merged(combined_corrected, combined_struct_tables)
+    combined_text_blocks = [b for blocks in all_text_blocks for b in blocks]
+    rendered_html = _render_merged(combined_corrected, combined_struct_tables, combined_text_blocks)
 
     page_label = "all" if page == -1 else f"p{page}"
     html_path = OUTPUT_DIR / f"{ts}_{safe_name}_{page_label}_rendered.html"
@@ -299,17 +304,24 @@ async def parse_document(
     )
 
 
-def _render_merged(merged_md: str, struct_tables: list[dict] | None = None) -> str:
+def _render_merged(
+    merged_md: str,
+    struct_tables: list[dict] | None = None,
+    text_blocks: list[dict] | None = None,
+) -> str:
     """Build styled HTML from merged markdown (headings + inline HTML tables).
 
     If *struct_tables* are provided, any VLM table that is just a header stub
     (single ``<tr>``) gets replaced by the matching Structure table HTML which
     preserves empty data rows.
+
+    If *text_blocks* are provided, text that the VLM missed (form headers,
+    footers, management numbers) is added at the top and bottom.
     """
     if not merged_md:
         body_html = '<p style="text-align:center;color:#888">No OCR output</p>'
     else:
-        body_html = _vlm_markdown_to_html(merged_md, struct_tables)
+        body_html = _vlm_markdown_to_html(merged_md, struct_tables, text_blocks)
 
     return f"""<!DOCTYPE html>
 <html lang="ko">
@@ -332,6 +344,7 @@ def _render_merged(merged_md: str, struct_tables: list[dict] | None = None) -> s
 def _vlm_markdown_to_html(
     md: str,
     struct_tables: list[dict] | None = None,
+    text_blocks: list[dict] | None = None,
 ) -> str:
     """Convert VLM markdown (with inline HTML tables) to styled HTML body content.
 
@@ -342,6 +355,10 @@ def _vlm_markdown_to_html(
     If a VLM table is a stub (only 1-2 ``<tr>`` rows), and *struct_tables*
     has a matching table with more rows, we swap in the Structure version
     so empty data rows are preserved.
+
+    If *text_blocks* are provided, any text the VLM missed (detected by
+    PP-StructureV3's overall OCR but not present in VLM output) is added
+    at the appropriate position based on vertical coordinates.
     """
     lines = md.split("\n")
     parts: list[str] = []
@@ -357,6 +374,35 @@ def _vlm_markdown_to_html(
             indexed.append((y_center, st))
         indexed.sort(key=lambda x: x[0])
         sorted_struct = [s for _, s in indexed]
+
+    # Collect VLM text content to detect what's missing
+    vlm_text_content = md.lower()
+
+    # Find text blocks that VLM missed — text that appears in Structure
+    # but NOT in VLM output. Split into header (top 15%) and footer (bottom 15%)
+    header_texts: list[str] = []
+    footer_texts: list[str] = []
+    if text_blocks:
+        sorted_blocks = sorted(text_blocks, key=lambda b: b.get("box", [0, 0, 0, 0])[1])
+        if sorted_blocks:
+            max_y = max(b.get("box", [0, 0, 0, 0])[3] for b in sorted_blocks) or 1
+            for blk in sorted_blocks:
+                txt = (blk.get("text") or "").strip()
+                if not txt or len(txt) < 3:
+                    continue
+                # Skip text that's already in VLM output
+                if txt.lower() in vlm_text_content or txt[:8].lower() in vlm_text_content:
+                    continue
+                y_top = blk.get("box", [0, 0, 0, 0])[1]
+                if y_top < max_y * 0.15:
+                    header_texts.append(txt)
+                elif y_top > max_y * 0.85:
+                    footer_texts.append(txt)
+
+    # Add header texts the VLM missed (form ID, regulation reference, etc.)
+    if header_texts:
+        for txt in header_texts:
+            parts.append(f'<p class="form-header-text">{_esc(txt)}</p>')
 
     for line in lines:
         stripped = line.strip()
@@ -403,6 +449,13 @@ def _vlm_markdown_to_html(
         # Regular text paragraphs
         else:
             parts.append(f"<p>{_esc(stripped)}</p>")
+
+    # Add footer texts the VLM missed (management number, print info, etc.)
+    if footer_texts:
+        parts.append('<div class="doc-footer">')
+        for txt in footer_texts:
+            parts.append(f'<p class="footer-text">{_esc(txt)}</p>')
+        parts.append("</div>")
 
     return "\n".join(parts)
 
@@ -640,6 +693,27 @@ thead th {
     margin-top: 6px;
     max-height: 500px;
     overflow-y: auto;
+}
+
+/* ── Form header/footer text (regulation refs, print info) ── */
+.form-header-text {
+    font-size: 9px;
+    color: #444;
+    margin: 2px 0;
+    line-height: 1.3;
+}
+
+.doc-footer {
+    margin-top: 20px;
+    padding-top: 8px;
+    border-top: 1px solid #ccc;
+}
+
+.footer-text {
+    font-size: 9px;
+    color: #555;
+    margin: 2px 0;
+    line-height: 1.3;
 }
 
 /* ── Footnotes / small text ───────────────────────────────── */
