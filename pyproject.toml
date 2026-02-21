@@ -1,0 +1,42 @@
+[project]
+name = "ocr-backend"
+version = "0.2.0"
+description = "Hybrid OCR pipeline for Korean financial documents"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "beautifulsoup4>=4.13.0",
+    "fastapi[standard]>=0.129.0",
+    "numpy>=2.0.0",
+    "opencv-contrib-python>=4.10.0",
+    "paddleocr[all]>=3.1.0",
+    "paddlepaddle-gpu==3.2.0",
+    "pillow>=10.0.0",
+    "pydantic-settings>=2.13.1",
+    "pymupdf>=1.27.1",
+    "python-multipart>=0.0.22",
+    "poethepoet>=0.32.0",
+]
+
+[[tool.uv.index]]
+name = "paddle-gpu"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu126/"
+explicit = true
+
+[tool.uv.sources]
+paddlepaddle-gpu = { index = "paddle-gpu" }
+
+[tool.poe.tasks]
+dev = "fastapi dev app/main.py"
+start = "fastapi run app/main.py"
+front = { shell = "cd ../frontend && npm run dev", interpreter = "bash" }
+
+[tool.poe.tasks.both]
+help = "Run backend (8000) + frontend (3000) in parallel"
+shell = """
+trap 'kill 0' EXIT
+fastapi dev app/main.py &
+(cd ../frontend && npm run dev) &
+wait
+"""
+interpreter = "bash"

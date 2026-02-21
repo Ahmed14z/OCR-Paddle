@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# .env file
+.env
+
+# outputs
+outputs/
+
+# Next.js (shouldn't be in backend)
+.next/
+
+# PaddleOCR model cache
+.paddlex/
+
+# Temp files
+*.tmp
+*.bak
