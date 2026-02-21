@@ -72,6 +72,97 @@ async def _run_in_thread_with_heartbeats(
     yield {"_result": result}
 
 
+async def _process_single_page(
+    image: np.ndarray,
+    engine: OCREngine,
+    ts: str,
+    safe_name: str,
+    page_idx: int,
+    t0: float,
+) -> AsyncGenerator[str | dict[str, Any], None]:
+    """Process a single page image through the OCR pipeline.
+
+    Yields SSE event strings for progress, and a final dict with key
+    ``"_page_result"`` containing the per-page output.
+    """
+    logger.info("Image shape: %s", image.shape)
+    _save_source(image, ts, safe_name, page_idx)
+
+    # -- Structure OCR --
+    yield _sse_event({"status": "running_structure_ocr"})
+    structure_result: dict[str, Any] | None = None
+    async for msg in _run_in_thread_with_heartbeats(
+        engine._run_structure, image, status_label="running_structure_ocr",
+    ):
+        if "_result" in msg:
+            structure_result = msg["_result"]
+        else:
+            yield _sse_event(msg)
+    assert structure_result is not None
+
+    # -- VLM OCR --
+    vlm_result: dict[str, Any] | None = None
+    if engine.vlm:
+        yield _sse_event({"status": "running_vlm"})
+        async for msg in _run_in_thread_with_heartbeats(
+            engine._run_vlm, image, status_label="running_vlm",
+        ):
+            if "_result" in msg:
+                vlm_result = msg["_result"]
+            else:
+                yield _sse_event(msg)
+
+    ocr_elapsed = round(time.time() - t0, 1)
+    ocr_result: dict[str, Any] = {
+        "structure": structure_result,
+        "vlm": vlm_result,
+        "elapsed_s": ocr_elapsed,
+    }
+
+    # Save OCR results
+    _save_json(ocr_result["structure"], ts, safe_name, page_idx, "structure")
+    if ocr_result["vlm"]:
+        _save_json(ocr_result["vlm"], ts, safe_name, page_idx, "vlm")
+
+    md = ocr_result["structure"].get("markdown", "")
+    if md:
+        md_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page_idx}_structure.md"
+        md_path.write_text(md, encoding="utf-8")
+        logger.info("Structure markdown saved to: %s", md_path)
+        logger.info("--- MARKDOWN (first 3000 chars) ---\n%s\n--- END ---", md[:3000])
+
+    vlm_md = ""
+    if ocr_result["vlm"]:
+        vlm_md = ocr_result["vlm"].get("markdown", "")
+        if vlm_md:
+            vlm_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page_idx}_vlm.md"
+            vlm_path.write_text(vlm_md, encoding="utf-8")
+            logger.info("VLM markdown saved to: %s", vlm_path)
+
+    # -- LLM post-correction for Korean character errors --
+    primary_md = vlm_md or md
+    corrected_md = primary_md
+    if primary_md and settings.openrouter_api_key:
+        yield _sse_event({"status": "correcting_korean"})
+        corrected_md = await correct_ocr_text(primary_md)
+        if corrected_md != primary_md:
+            corrected_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page_idx}_corrected.md"
+            corrected_path.write_text(corrected_md, encoding="utf-8")
+            logger.info("LLM-corrected markdown saved to: %s", corrected_path)
+
+    struct_tables = ocr_result["structure"].get("tables", [])
+
+    yield {
+        "_page_result": {
+            "md": md,
+            "vlm_md": vlm_md,
+            "corrected_md": corrected_md,
+            "struct_tables": struct_tables,
+            "ocr_elapsed_s": ocr_result["elapsed_s"],
+        }
+    }
+
+
 async def _parse_sse_generator(
     content: bytes,
     content_type: str,
@@ -91,123 +182,85 @@ async def _parse_sse_generator(
     if content_type == "application/pdf":
         logger.info("Converting PDF to images (%d dpi)...", settings.pdf_dpi)
         loop = asyncio.get_running_loop()
-        pages = await loop.run_in_executor(
+        pdf_pages = await loop.run_in_executor(
             _ocr_executor, pdf_pages_to_images, content, settings.pdf_dpi,
         )
-        logger.info("PDF has %d pages", len(pages))
-        if page >= len(pages):
-            yield _sse_event({"status": "error", "message": f"Page {page} out of range (0-{len(pages) - 1})"})
+        total_pages = len(pdf_pages)
+        logger.info("PDF has %d pages", total_pages)
+
+        if page == -1:
+            pages_to_process = list(range(total_pages))
+        elif page >= total_pages:
+            yield _sse_event({"status": "error", "message": f"Page {page + 1} out of range (1-{total_pages})"})
             return
-        image = pages[page]
-        total_pages = len(pages)
+        else:
+            pages_to_process = [page]
     elif content_type and content_type.startswith("image/"):
-        image = image_bytes_to_numpy(content)
+        pdf_pages = [image_bytes_to_numpy(content)]
         total_pages = 1
+        pages_to_process = [0]
     else:
         yield _sse_event({"status": "error", "message": "Unsupported file type. Upload PDF or image."})
         return
 
-    logger.info("Image shape: %s", image.shape)
-
-    # Save source image
     ts = time.strftime("%H%M%S")
     safe_name = (filename or "doc").replace(" ", "_")[:30]
-    _save_source(image, ts, safe_name, page)
-
-    # -- 3. Structure OCR (PP-StructureV3) with heartbeats --
-    yield _sse_event({"status": "running_structure_ocr"})
-
     engine = _get_engine()
 
-    structure_result: dict[str, Any] | None = None
-    async for msg in _run_in_thread_with_heartbeats(
-        engine._run_structure, image, status_label="running_structure_ocr",
-    ):
-        if "_result" in msg:
-            structure_result = msg["_result"]
-        else:
-            yield _sse_event(msg)
+    all_md: list[str] = []
+    all_vlm_md: list[str] = []
+    all_corrected_md: list[str] = []
+    all_struct_tables: list[list[Any]] = []
+    last_ocr_elapsed = 0.0
 
-    assert structure_result is not None
+    for idx, page_idx in enumerate(pages_to_process):
+        if len(pages_to_process) > 1:
+            yield _sse_event({
+                "status": "processing",
+                "message": f"Processing page {idx + 1} of {len(pages_to_process)}...",
+            })
 
-    # -- 4. VLM OCR (PaddleOCR-VL) with heartbeats --
-    vlm_result: dict[str, Any] | None = None
-    if engine.vlm:
-        yield _sse_event({"status": "running_vlm"})
-        async for msg in _run_in_thread_with_heartbeats(
-            engine._run_vlm, image, status_label="running_vlm",
-        ):
-            if "_result" in msg:
-                vlm_result = msg["_result"]
+        image = pdf_pages[page_idx]
+        async for event in _process_single_page(image, engine, ts, safe_name, page_idx, t0):
+            if isinstance(event, dict) and "_page_result" in event:
+                pr = event["_page_result"]
+                all_md.append(pr["md"])
+                all_vlm_md.append(pr["vlm_md"])
+                all_corrected_md.append(pr["corrected_md"])
+                all_struct_tables.append(pr["struct_tables"])
+                last_ocr_elapsed = pr["ocr_elapsed_s"]
             else:
-                yield _sse_event(msg)
+                yield event  # type: ignore[misc]
 
-    ocr_elapsed = round(time.time() - t0, 1)
-
-    ocr_result: dict[str, Any] = {
-        "structure": structure_result,
-        "vlm": vlm_result,
-        "elapsed_s": ocr_elapsed,
-    }
-
-    # Save OCR results
-    _save_json(ocr_result["structure"], ts, safe_name, page, "structure")
-    if ocr_result["vlm"]:
-        _save_json(ocr_result["vlm"], ts, safe_name, page, "vlm")
-
-    # Save markdown
-    md = ocr_result["structure"].get("markdown", "")
-    if md:
-        md_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page}_structure.md"
-        md_path.write_text(md, encoding="utf-8")
-        logger.info("Structure markdown saved to: %s", md_path)
-        logger.info("--- MARKDOWN (first 3000 chars) ---\n%s\n--- END ---", md[:3000])
-
-    vlm_md = ""
-    if ocr_result["vlm"]:
-        vlm_md = ocr_result["vlm"].get("markdown", "")
-        if vlm_md:
-            vlm_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page}_vlm.md"
-            vlm_path.write_text(vlm_md, encoding="utf-8")
-            logger.info("VLM markdown saved to: %s", vlm_path)
-
-    # -- 5. LLM post-correction for Korean character errors --
-    # Use VLM markdown as primary (best table structure), fix chars via LLM
-    primary_md = vlm_md or md
-    corrected_md = primary_md
-
-    if primary_md and settings.openrouter_api_key:
-        yield _sse_event({"status": "correcting_korean"})
-        corrected_md = await correct_ocr_text(primary_md)
-        if corrected_md != primary_md:
-            corrected_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page}_corrected.md"
-            corrected_path.write_text(corrected_md, encoding="utf-8")
-            logger.info("LLM-corrected markdown saved to: %s", corrected_path)
-
-    # -- 6. Render HTML --
+    # -- Render HTML --
     yield _sse_event({"status": "rendering"})
 
-    # Pass structure tables so we can fill in empty-row tables the VLM skipped
-    struct_tables = ocr_result["structure"].get("tables", [])
-    rendered_html = _render_merged(corrected_md, struct_tables)
-    html_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page}_rendered.html"
+    combined_corrected = "\n\n".join(filter(None, all_corrected_md))
+    combined_struct_tables = [t for tables in all_struct_tables for t in tables]
+    rendered_html = _render_merged(combined_corrected, combined_struct_tables)
+
+    page_label = "all" if page == -1 else f"p{page}"
+    html_path = OUTPUT_DIR / f"{ts}_{safe_name}_{page_label}_rendered.html"
     html_path.write_text(rendered_html, encoding="utf-8")
     logger.info("Rendered HTML saved to: %s", html_path)
 
     elapsed = time.time() - t0
     logger.info("=== Parse complete in %.1fs ===", elapsed)
 
-    # -- 7. Final complete event with full payload --
+    combined_md = "\n\n".join(filter(None, all_md))
+    combined_vlm = "\n\n".join(filter(None, all_vlm_md))
+
+    # -- Final complete event with full payload --
     yield _sse_event({
         "status": "complete",
         "result": {
             "page": page,
             "total_pages": total_pages,
-            "structure_markdown": md,
-            "vlm_markdown": vlm_md,
-            "corrected_markdown": corrected_md,
+            "structure_markdown": combined_md,
+            "vlm_markdown": combined_vlm,
+            "corrected_markdown": combined_corrected,
             "rendered_html": rendered_html,
-            "ocr_elapsed_s": ocr_result["elapsed_s"],
+            "ocr_elapsed_s": last_ocr_elapsed,
             "total_elapsed_s": round(elapsed, 1),
         },
     })
