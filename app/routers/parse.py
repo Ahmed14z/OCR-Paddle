@@ -187,7 +187,9 @@ async def _parse_sse_generator(
     # -- 6. Render HTML --
     yield _sse_event({"status": "rendering"})
 
-    rendered_html = _render_merged(corrected_md)
+    # Pass structure tables so we can fill in empty-row tables the VLM skipped
+    struct_tables = ocr_result["structure"].get("tables", [])
+    rendered_html = _render_merged(corrected_md, struct_tables)
     html_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page}_rendered.html"
     html_path.write_text(rendered_html, encoding="utf-8")
     logger.info("Rendered HTML saved to: %s", html_path)
@@ -244,12 +246,17 @@ async def parse_document(
     )
 
 
-def _render_merged(merged_md: str) -> str:
-    """Build styled HTML from merged markdown (headings + inline HTML tables)."""
+def _render_merged(merged_md: str, struct_tables: list[dict] | None = None) -> str:
+    """Build styled HTML from merged markdown (headings + inline HTML tables).
+
+    If *struct_tables* are provided, any VLM table that is just a header stub
+    (single ``<tr>``) gets replaced by the matching Structure table HTML which
+    preserves empty data rows.
+    """
     if not merged_md:
         body_html = '<p style="text-align:center;color:#888">No OCR output</p>'
     else:
-        body_html = _vlm_markdown_to_html(merged_md)
+        body_html = _vlm_markdown_to_html(merged_md, struct_tables)
 
     return f"""<!DOCTYPE html>
 <html lang="ko">
@@ -269,17 +276,34 @@ def _render_merged(merged_md: str) -> str:
 </html>"""
 
 
-def _vlm_markdown_to_html(md: str) -> str:
+def _vlm_markdown_to_html(
+    md: str,
+    struct_tables: list[dict] | None = None,
+) -> str:
     """Convert VLM markdown (with inline HTML tables) to styled HTML body content.
 
     VLM output is markdown with headings (###), paragraphs, and raw HTML
     <table> blocks. We convert headings to styled divs and pass tables
     through our enhancer for numeric cell styling.
-    """
-    import re as _re
 
+    If a VLM table is a stub (only 1-2 ``<tr>`` rows), and *struct_tables*
+    has a matching table with more rows, we swap in the Structure version
+    so empty data rows are preserved.
+    """
     lines = md.split("\n")
     parts: list[str] = []
+    vlm_table_idx = 0
+
+    # Sort structure tables by vertical position for matching
+    sorted_struct: list[dict] = []
+    if struct_tables:
+        indexed = []
+        for st in struct_tables:
+            boxes = st.get("cell_boxes", [])
+            y_center = sum((b[1] + b[3]) / 2 for b in boxes) / len(boxes) if boxes else float("inf")
+            indexed.append((y_center, st))
+        indexed.sort(key=lambda x: x[0])
+        sorted_struct = [s for _, s in indexed]
 
     for line in lines:
         stripped = line.strip()
@@ -297,11 +321,27 @@ def _vlm_markdown_to_html(md: str) -> str:
             text = stripped.lstrip("# ").strip()
             parts.append(f'<div class="section-label" style="font-size:13px">{_esc(text)}</div>')
 
-        # Raw HTML tables — enhance with numeric cell classes
+        # Raw HTML tables — check if stub, possibly replace
         elif "<table" in stripped:
+            table_html = stripped
+            tr_count = stripped.lower().count("<tr")
+
+            # If VLM table is a stub (≤2 rows) and we have a matching
+            # Structure table with more rows, use the Structure version
+            if tr_count <= 2 and vlm_table_idx < len(sorted_struct):
+                struct_html = sorted_struct[vlm_table_idx].get("html", "")
+                struct_tr_count = struct_html.lower().count("<tr")
+                if struct_tr_count > tr_count:
+                    logger.info(
+                        "Table %d: VLM has %d rows (stub), Structure has %d — using Structure HTML",
+                        vlm_table_idx, tr_count, struct_tr_count,
+                    )
+                    table_html = struct_html
+
             parts.append('<div class="table-section">')
-            parts.append(_enhance_table_html(stripped))
+            parts.append(_enhance_table_html(table_html))
             parts.append("</div>")
+            vlm_table_idx += 1
 
         # Footnotes / small text
         elif stripped.startswith("*"):
@@ -395,12 +435,13 @@ body {
 
 /* ── Page container (mimics printed A4 form) ──────────────── */
 .gov-page {
-    max-width: 860px;
+    max-width: none;
     margin: 0 auto;
     background: #fff;
     border: 2px solid #000;
     padding: 28px 30px 24px;
     box-shadow: 0 1px 6px rgba(0,0,0,.12);
+    overflow-x: auto;
 }
 
 /* ── Document header block ────────────────────────────────── */
