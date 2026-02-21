@@ -159,7 +159,11 @@ class OCREngine:
                 Image.fromarray(image).save(f, format="PNG")
 
             try:
-                results = list(self.vlm.predict(tmp_path, use_queues=False))
+                results = list(self.vlm.predict(
+                    tmp_path,
+                    use_queues=False,
+                    max_pixels=settings.vlm_max_pixels,
+                ))
             finally:
                 os.unlink(tmp_path)
 

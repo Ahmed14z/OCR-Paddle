@@ -13,7 +13,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
-from app.services.merge import merge_ocr_results
+from app.services.llm_correct import correct_ocr_text
 from app.services.ocr import OCREngine
 from app.services.pdf import image_bytes_to_numpy, pdf_pages_to_images
 
@@ -171,16 +171,23 @@ async def _parse_sse_generator(
             vlm_path.write_text(vlm_md, encoding="utf-8")
             logger.info("VLM markdown saved to: %s", vlm_path)
 
-    # -- 5. Merge + Render HTML --
+    # -- 5. LLM post-correction for Korean character errors --
+    # Use VLM markdown as primary (best table structure), fix chars via LLM
+    primary_md = vlm_md or md
+    corrected_md = primary_md
+
+    if primary_md and settings.openrouter_api_key:
+        yield _sse_event({"status": "correcting_korean"})
+        corrected_md = await correct_ocr_text(primary_md)
+        if corrected_md != primary_md:
+            corrected_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page}_corrected.md"
+            corrected_path.write_text(corrected_md, encoding="utf-8")
+            logger.info("LLM-corrected markdown saved to: %s", corrected_path)
+
+    # -- 6. Render HTML --
     yield _sse_event({"status": "rendering"})
 
-    merged_md = merge_ocr_results(ocr_result["structure"], ocr_result.get("vlm"))
-    if merged_md:
-        merged_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page}_merged.md"
-        merged_path.write_text(merged_md, encoding="utf-8")
-        logger.info("Merged markdown saved to: %s", merged_path)
-
-    rendered_html = _render_merged(merged_md)
+    rendered_html = _render_merged(corrected_md)
     html_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page}_rendered.html"
     html_path.write_text(rendered_html, encoding="utf-8")
     logger.info("Rendered HTML saved to: %s", html_path)
@@ -188,7 +195,7 @@ async def _parse_sse_generator(
     elapsed = time.time() - t0
     logger.info("=== Parse complete in %.1fs ===", elapsed)
 
-    # -- 6. Final complete event with full payload --
+    # -- 7. Final complete event with full payload --
     yield _sse_event({
         "status": "complete",
         "result": {
@@ -196,7 +203,7 @@ async def _parse_sse_generator(
             "total_pages": total_pages,
             "structure_markdown": md,
             "vlm_markdown": vlm_md,
-            "merged_markdown": merged_md,
+            "corrected_markdown": corrected_md,
             "rendered_html": rendered_html,
             "ocr_elapsed_s": ocr_result["elapsed_s"],
             "total_elapsed_s": round(elapsed, 1),
