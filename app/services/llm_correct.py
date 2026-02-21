@@ -37,9 +37,23 @@ async def correct_ocr_text(ocr_markdown: str) -> str:
     if not ocr_markdown.strip():
         return ocr_markdown
 
-    logger.info("Sending OCR text to LLM for Korean correction (%d chars)...", len(ocr_markdown))
+    key_preview = settings.openrouter_api_key[:12] + "..." if len(settings.openrouter_api_key) > 12 else settings.openrouter_api_key
+    logger.info(
+        "Sending OCR text to LLM (model=%s, key=%s, %d chars)...",
+        settings.openrouter_model, key_preview, len(ocr_markdown),
+    )
 
     try:
+        payload = {
+            "model": settings.openrouter_model,
+            "messages": [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": ocr_markdown},
+            ],
+            "temperature": 0.0,
+            "max_tokens": min(len(ocr_markdown) * 2, 16000),
+        }
+
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -47,16 +61,10 @@ async def correct_ocr_text(ocr_markdown: str) -> str:
                     "Authorization": f"Bearer {settings.openrouter_api_key}",
                     "Content-Type": "application/json",
                 },
-                json={
-                    "model": settings.openrouter_model,
-                    "messages": [
-                        {"role": "system", "content": _SYSTEM_PROMPT},
-                        {"role": "user", "content": ocr_markdown},
-                    ],
-                    "temperature": 0.0,
-                    "max_tokens": len(ocr_markdown) * 2,
-                },
+                json=payload,
             )
+            if resp.status_code != 200:
+                logger.error("LLM API error %d: %s", resp.status_code, resp.text[:500])
             resp.raise_for_status()
 
         data: dict[str, Any] = resp.json()
