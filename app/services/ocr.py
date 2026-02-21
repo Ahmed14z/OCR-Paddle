@@ -57,7 +57,7 @@ class OCREngine:
 
             logger.info("Initializing PaddleOCR-VL-1.5...")
             t0 = time.time()
-            self.vlm = PaddleOCRVL(device=settings.ocr_device)
+            self.vlm = PaddleOCRVL(device=settings.ocr_device, use_queues=False)
             logger.info("PaddleOCR-VL-1.5 ready in %.1fs", time.time() - t0)
         except (ImportError, Exception) as e:
             logger.warning("PaddleOCR-VL not available: %s — using PP-StructureV3 only", e)
@@ -159,7 +159,7 @@ class OCREngine:
                 Image.fromarray(image).save(f, format="PNG")
 
             try:
-                results = list(self.vlm.predict(tmp_path))
+                results = list(self.vlm.predict(tmp_path, use_queues=False))
             finally:
                 os.unlink(tmp_path)
 

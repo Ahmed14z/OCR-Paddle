@@ -1,12 +1,16 @@
+import asyncio
 import json
 import logging
 import re
 import time
+from collections.abc import AsyncGenerator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import numpy as np
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 
 from app.config import settings
 from app.services.ocr import OCREngine
@@ -20,54 +24,130 @@ MAX_SIZE = settings.max_file_size_mb * 1024 * 1024
 OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+# Thread pool for running blocking OCR inference off the async event loop
+_ocr_executor = ThreadPoolExecutor(max_workers=1)
+
+# Heartbeat interval in seconds - must be well under proxy timeout (~100s)
+_HEARTBEAT_INTERVAL = 5.0
+
 
 def _get_engine() -> OCREngine:
     return OCREngine.get()
 
 
-@router.post("/parse")
-async def parse_document(
-    file: UploadFile = File(...),
-    page: Annotated[int, Form()] = 0,
-):
-    """Parse a document using dual OCR engine and return structured results."""
-    if not file.content_type:
-        raise HTTPException(400, "Missing content type")
+def _sse_event(data: dict[str, Any]) -> str:
+    """Format a dict as an SSE `data:` line."""
+    return f"data: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
 
-    logger.info("=== Parse request: %s (%s) page=%d ===", file.filename, file.content_type, page)
+
+async def _run_in_thread_with_heartbeats(
+    func: Any,
+    *args: Any,
+    status_label: str = "processing",
+    loop: asyncio.AbstractEventLoop | None = None,
+) -> Any:
+    """Run a blocking *func* in a thread while yielding heartbeat dicts.
+
+    This is an async generator.  It yields SSE-ready dicts while *func*
+    executes, then yields a final ``{"_result": <return value>}`` dict so
+    the caller can retrieve the actual result.
+    """
+    if loop is None:
+        loop = asyncio.get_running_loop()
+
+    future = loop.run_in_executor(_ocr_executor, func, *args)
+    t_start = time.time()
+
+    while not future.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(future), timeout=_HEARTBEAT_INTERVAL)
+            # Future completed within the heartbeat window
+            break
+        except asyncio.TimeoutError:
+            elapsed = round(time.time() - t_start, 1)
+            yield {"status": status_label, "elapsed": elapsed}
+
+    result = future.result()  # propagate exceptions if any
+    yield {"_result": result}
+
+
+async def _parse_sse_generator(
+    content: bytes,
+    content_type: str,
+    filename: str,
+    page: int,
+) -> AsyncGenerator[str, None]:
+    """Async generator that drives the parse pipeline and yields SSE events."""
     t0 = time.time()
 
-    content = await file.read()
+    # -- 1. Upload acknowledged --
+    yield _sse_event({"status": "uploading"})
     logger.info("File size: %.1f MB", len(content) / 1024 / 1024)
 
-    if len(content) > MAX_SIZE:
-        raise HTTPException(413, f"File too large. Max {settings.max_file_size_mb}MB")
+    # -- 2. PDF / image conversion --
+    yield _sse_event({"status": "converting_pdf"})
 
-    # Convert to numpy image
-    if file.content_type == "application/pdf":
+    if content_type == "application/pdf":
         logger.info("Converting PDF to images (%d dpi)...", settings.pdf_dpi)
-        pages = pdf_pages_to_images(content, dpi=settings.pdf_dpi)
+        loop = asyncio.get_running_loop()
+        pages = await loop.run_in_executor(
+            _ocr_executor, pdf_pages_to_images, content, settings.pdf_dpi,
+        )
         logger.info("PDF has %d pages", len(pages))
         if page >= len(pages):
-            raise HTTPException(400, f"Page {page} out of range (0-{len(pages) - 1})")
+            yield _sse_event({"status": "error", "message": f"Page {page} out of range (0-{len(pages) - 1})"})
+            return
         image = pages[page]
         total_pages = len(pages)
-    elif file.content_type and file.content_type.startswith("image/"):
+    elif content_type and content_type.startswith("image/"):
         image = image_bytes_to_numpy(content)
         total_pages = 1
     else:
-        raise HTTPException(400, "Unsupported file type. Upload PDF or image.")
+        yield _sse_event({"status": "error", "message": "Unsupported file type. Upload PDF or image."})
+        return
 
     logger.info("Image shape: %s", image.shape)
 
     # Save source image
     ts = time.strftime("%H%M%S")
-    safe_name = (file.filename or "doc").replace(" ", "_")[:30]
+    safe_name = (filename or "doc").replace(" ", "_")[:30]
     _save_source(image, ts, safe_name, page)
 
-    # Run dual OCR
+    # -- 3. Structure OCR (PP-StructureV3) with heartbeats --
+    yield _sse_event({"status": "running_structure_ocr"})
+
     engine = _get_engine()
-    ocr_result = engine.extract(image)
+
+    structure_result: dict[str, Any] | None = None
+    async for msg in _run_in_thread_with_heartbeats(
+        engine._run_structure, image, status_label="running_structure_ocr",
+    ):
+        if "_result" in msg:
+            structure_result = msg["_result"]
+        else:
+            yield _sse_event(msg)
+
+    assert structure_result is not None
+
+    # -- 4. VLM OCR (PaddleOCR-VL) with heartbeats --
+    vlm_result: dict[str, Any] | None = None
+    if engine.vlm:
+        yield _sse_event({"status": "running_vlm"})
+        async for msg in _run_in_thread_with_heartbeats(
+            engine._run_vlm, image, status_label="running_vlm",
+        ):
+            if "_result" in msg:
+                vlm_result = msg["_result"]
+            else:
+                yield _sse_event(msg)
+
+    ocr_elapsed = round(time.time() - t0, 1)
+
+    ocr_result: dict[str, Any] = {
+        "structure": structure_result,
+        "vlm": vlm_result,
+        "elapsed_s": ocr_elapsed,
+    }
 
     # Save OCR results
     _save_json(ocr_result["structure"], ts, safe_name, page, "structure")
@@ -90,11 +170,10 @@ async def parse_document(
             vlm_path.write_text(vlm_md, encoding="utf-8")
             logger.info("VLM markdown saved to: %s", vlm_path)
 
-    # Render form HTML from structure markdown
-    # For now, pass the raw structure data; the renderer builds the form
-    # TODO: parse markdown into structured fields for form template
-    rendered_html = _render_from_structure(ocr_result)
+    # -- 5. Render HTML --
+    yield _sse_event({"status": "rendering"})
 
+    rendered_html = _render_from_structure(ocr_result)
     html_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page}_rendered.html"
     html_path.write_text(rendered_html, encoding="utf-8")
     logger.info("Rendered HTML saved to: %s", html_path)
@@ -102,15 +181,52 @@ async def parse_document(
     elapsed = time.time() - t0
     logger.info("=== Parse complete in %.1fs ===", elapsed)
 
-    return {
-        "page": page,
-        "total_pages": total_pages,
-        "structure_markdown": md,
-        "vlm_markdown": vlm_md,
-        "rendered_html": rendered_html,
-        "ocr_elapsed_s": ocr_result["elapsed_s"],
-        "total_elapsed_s": round(elapsed, 1),
-    }
+    # -- 6. Final complete event with full payload --
+    yield _sse_event({
+        "status": "complete",
+        "result": {
+            "page": page,
+            "total_pages": total_pages,
+            "structure_markdown": md,
+            "vlm_markdown": vlm_md,
+            "rendered_html": rendered_html,
+            "ocr_elapsed_s": ocr_result["elapsed_s"],
+            "total_elapsed_s": round(elapsed, 1),
+        },
+    })
+
+
+@router.post("/parse")
+async def parse_document(
+    file: UploadFile = File(...),
+    page: Annotated[int, Form()] = 0,
+) -> StreamingResponse:
+    """Parse a document using dual OCR engine, streaming progress via SSE.
+
+    Returns ``text/event-stream`` with progress heartbeats so the
+    connection survives RunPod / Cloudflare proxy timeouts.
+    """
+    if not file.content_type:
+        raise HTTPException(400, "Missing content type")
+
+    logger.info("=== Parse request: %s (%s) page=%d ===", file.filename, file.content_type, page)
+
+    content = await file.read()
+    if len(content) > MAX_SIZE:
+        raise HTTPException(413, f"File too large. Max {settings.max_file_size_mb}MB")
+
+    content_type = file.content_type
+    filename = file.filename or "document"
+
+    return StreamingResponse(
+        _parse_sse_generator(content, content_type, filename, page),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # disable nginx buffering
+        },
+    )
 
 
 def _render_from_structure(ocr_result: dict) -> str:

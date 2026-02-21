@@ -29,6 +29,7 @@ paddlepaddle-gpu = { index = "paddle-gpu" }
 [tool.poe.tasks]
 dev = "fastapi dev app/main.py"
 start = "fastapi run app/main.py"
+serve = "uvicorn app.main:app --host 0.0.0.0 --port 8000"
 front = { shell = "cd ../frontend && npm run dev", interpreter = "bash" }
 
 [tool.poe.tasks.both]
