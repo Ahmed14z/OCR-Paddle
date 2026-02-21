@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +14,20 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-app = FastAPI(title="Korean Document OCR", version="0.2.0")
+logger = logging.getLogger("ocr.app")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Pre-load all OCR models at startup so first request isn't slow
+    logger.info("Pre-loading OCR models...")
+    from app.services.ocr import OCREngine
+    OCREngine.get()
+    logger.info("OCR models ready — accepting requests")
+    yield
+
+
+app = FastAPI(title="Korean Document OCR", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
