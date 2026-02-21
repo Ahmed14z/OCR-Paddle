@@ -173,7 +173,7 @@ async def _parse_sse_generator(
     # -- 5. Render HTML --
     yield _sse_event({"status": "rendering"})
 
-    rendered_html = _render_from_structure(ocr_result)
+    rendered_html = _render_from_ocr(ocr_result)
     html_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page}_rendered.html"
     html_path.write_text(rendered_html, encoding="utf-8")
     logger.info("Rendered HTML saved to: %s", html_path)
@@ -229,139 +229,99 @@ async def parse_document(
     )
 
 
-def _render_from_structure(ocr_result: dict) -> str:
-    """Build the form-replica HTML from OCR output.
+def _render_from_ocr(ocr_result: dict) -> str:
+    """Build styled HTML from OCR output.
 
-    Produces professional HTML styled like Korean government tax forms
-    (매입처별세금계산서합계표).  Uses structure tables, text blocks, and
-    the raw markdown from PP-StructureV3.
+    Uses VLM markdown as primary source (better table structure and numbers),
+    falls back to PP-StructureV3 tables only when VLM is unavailable.
     """
+    vlm = ocr_result.get("vlm") or {}
+    vlm_md: str = vlm.get("markdown", "")
     structure = ocr_result.get("structure", {})
-    md: str = structure.get("markdown", "")
-    tables: list[dict] = structure.get("tables", [])
-    text_blocks: list[dict] = structure.get("text_blocks", [])
+    structure_md: str = structure.get("markdown", "")
 
-    # Collect usable table HTML fragments
-    table_htmls: list[str] = [t["html"] for t in tables if t.get("html")]
-
-    # ── Classify text blocks by vertical position ──────────────
-    # Sort by the top-edge (box[1]) so we can split header-area text from
-    # the rest.  Blocks in the upper 25 % of the page are treated as
-    # header / title / period / submitter info.
-    sorted_blocks = sorted(text_blocks, key=lambda b: b.get("box", [0, 0, 0, 0])[1])
-
-    if sorted_blocks:
-        max_y = max(b.get("box", [0, 0, 0, 0])[3] for b in sorted_blocks) or 1
-        header_cutoff = max_y * 0.25
+    # VLM markdown contains proper HTML tables inline — use it directly
+    if vlm_md:
+        body_html = _vlm_markdown_to_html(vlm_md)
     else:
-        header_cutoff = 0.0
-
-    header_blocks: list[dict] = []
-    body_blocks: list[dict] = []
-    for blk in sorted_blocks:
-        top_y = blk.get("box", [0, 0, 0, 0])[1]
-        if top_y <= header_cutoff:
-            header_blocks.append(blk)
+        # Fallback: use PP-StructureV3 tables
+        tables: list[dict] = structure.get("tables", [])
+        table_htmls = [t["html"] for t in tables if t.get("html")]
+        if table_htmls:
+            sections = []
+            for i, raw_html in enumerate(table_htmls):
+                styled = _enhance_table_html(raw_html)
+                label = f"Table {i + 1}" if len(table_htmls) > 1 else ""
+                section = '<div class="table-section">'
+                if label:
+                    section += f'<div class="section-label">{label}</div>'
+                section += styled + "</div>"
+                sections.append(section)
+            body_html = "\n".join(sections)
+        elif structure_md:
+            body_html = f'<div class="table-section"><pre>{_esc(structure_md)}</pre></div>'
         else:
-            body_blocks.append(blk)
+            body_html = '<p style="text-align:center;color:#888">No OCR output</p>'
 
-    # ── Try to identify a document title ───────────────────────
-    # The tallest / most-confident block near the top is likely the title.
-    doc_title = ""
-    info_blocks: list[dict] = []
-    if header_blocks:
-        # Pick the block whose bounding box has the largest height as title
-        def _box_height(b: dict) -> float:
-            box = b.get("box", [0, 0, 0, 0])
-            return abs(box[3] - box[1])
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OCR Result</title>
+<style>
+{RESULT_CSS}
+</style>
+</head>
+<body>
+<div class="gov-page">
+{body_html}
+</div>
+</body>
+</html>"""
 
-        title_candidate = max(header_blocks, key=_box_height)
-        doc_title = title_candidate.get("text", "").strip()
-        info_blocks = [b for b in header_blocks if b is not title_candidate]
 
-    # ── Start building HTML ────────────────────────────────────
-    parts: list[str] = [
-        "<!DOCTYPE html>",
-        '<html lang="ko">',
-        "<head>",
-        '<meta charset="UTF-8">',
-        '<meta name="viewport" content="width=device-width, initial-scale=1">',
-        "<title>OCR Result</title>",
-        "<style>",
-        RESULT_CSS,
-        "</style>",
-        "</head>",
-        "<body>",
-        '<div class="gov-page">',
-    ]
+def _vlm_markdown_to_html(md: str) -> str:
+    """Convert VLM markdown (with inline HTML tables) to styled HTML body content.
 
-    # ── Document header ────────────────────────────────────────
-    parts.append('<div class="doc-header">')
-    if doc_title:
-        parts.append(f'<div class="doc-title">{_esc(doc_title)}</div>')
-    else:
-        parts.append('<div class="doc-title">OCR Document</div>')
-    parts.append("</div>")  # .doc-header
+    VLM output is markdown with headings (###), paragraphs, and raw HTML
+    <table> blocks. We convert headings to styled divs and pass tables
+    through our enhancer for numeric cell styling.
+    """
+    import re as _re
 
-    # ── Info rows from header text blocks ──────────────────────
-    if info_blocks:
-        parts.append('<div class="info-grid">')
-        for blk in info_blocks:
-            txt = (blk.get("text") or "").strip()
-            if not txt:
-                continue
-            # Try to split on common Korean delimiters (: , 】 등)
-            label, value = _split_label_value(txt)
-            parts.append('<div class="info-row">')
-            parts.append(f'<div class="info-label">{_esc(label)}</div>')
-            parts.append(f'<div class="info-value">{_esc(value)}</div>')
-            parts.append("</div>")
-        parts.append("</div>")  # .info-grid
+    lines = md.split("\n")
+    parts: list[str] = []
 
-    # ── Tables ─────────────────────────────────────────────────
-    if table_htmls:
-        for i, raw_html in enumerate(table_htmls):
-            styled = _enhance_table_html(raw_html)
-            label = f"Table {i + 1}" if len(table_htmls) > 1 else ""
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Headings → styled sections
+        if stripped.startswith("# "):
+            text = stripped.lstrip("# ").strip()
+            parts.append(f'<div class="doc-header"><div class="doc-title">{_esc(text)}</div></div>')
+        elif stripped.startswith("### "):
+            text = stripped.lstrip("# ").strip()
+            parts.append(f'<div class="section-label">{_esc(text)}</div>')
+        elif stripped.startswith("## "):
+            text = stripped.lstrip("# ").strip()
+            parts.append(f'<div class="section-label" style="font-size:13px">{_esc(text)}</div>')
+
+        # Raw HTML tables — enhance with numeric cell classes
+        elif "<table" in stripped:
             parts.append('<div class="table-section">')
-            if label:
-                parts.append(f'<div class="section-label">{label}</div>')
-            parts.append(styled)
-            parts.append("</div>")
-    elif md:
-        # Fallback: render markdown as preformatted text inside the page
-        parts.append('<div class="table-section">')
-        parts.append(f"<pre>{_esc(md)}</pre>")
-        parts.append("</div>")
-
-    # ── Non-header text blocks below the tables ────────────────
-    if body_blocks:
-        remaining_texts = [
-            (b.get("text") or "").strip() for b in body_blocks
-        ]
-        remaining_texts = [t for t in remaining_texts if t]
-        if remaining_texts:
-            parts.append('<div class="info-grid" style="margin-top:10px">')
-            for txt in remaining_texts:
-                label, value = _split_label_value(txt)
-                parts.append('<div class="info-row">')
-                parts.append(f'<div class="info-label">{_esc(label)}</div>')
-                parts.append(f'<div class="info-value">{_esc(value)}</div>')
-                parts.append("</div>")
+            parts.append(_enhance_table_html(stripped))
             parts.append("</div>")
 
-    # ── Collapsible raw markdown reference ─────────────────────
-    if md:
-        parts.append('<div class="raw-reference">')
-        parts.append("<details>")
-        parts.append("<summary>Raw OCR Markdown (click to expand)</summary>")
-        parts.append(f"<pre>{_esc(md)}</pre>")
-        parts.append("</details>")
-        parts.append("</div>")
+        # Footnotes / small text
+        elif stripped.startswith("*"):
+            parts.append(f'<p class="footnote">{_esc(stripped)}</p>')
 
-    parts.append("</div>")  # .gov-page
-    parts.append("</body>")
-    parts.append("</html>")
+        # Regular text paragraphs
+        else:
+            parts.append(f"<p>{_esc(stripped)}</p>")
 
     return "\n".join(parts)
 
@@ -598,6 +558,19 @@ thead th {
     margin-top: 6px;
     max-height: 500px;
     overflow-y: auto;
+}
+
+/* ── Footnotes / small text ───────────────────────────────── */
+.footnote {
+    font-size: 9px;
+    color: #555;
+    margin: 6px 0;
+    line-height: 1.4;
+}
+
+p {
+    font-size: 11px;
+    margin: 4px 0;
 }
 
 /* ── Print-friendly ───────────────────────────────────────── */
