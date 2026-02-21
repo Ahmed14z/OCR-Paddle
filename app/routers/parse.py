@@ -13,6 +13,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
+from app.services.merge import merge_ocr_results
 from app.services.ocr import OCREngine
 from app.services.pdf import image_bytes_to_numpy, pdf_pages_to_images
 
@@ -170,10 +171,16 @@ async def _parse_sse_generator(
             vlm_path.write_text(vlm_md, encoding="utf-8")
             logger.info("VLM markdown saved to: %s", vlm_path)
 
-    # -- 5. Render HTML --
+    # -- 5. Merge + Render HTML --
     yield _sse_event({"status": "rendering"})
 
-    rendered_html = _render_from_ocr(ocr_result)
+    merged_md = merge_ocr_results(ocr_result["structure"], ocr_result.get("vlm"))
+    if merged_md:
+        merged_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page}_merged.md"
+        merged_path.write_text(merged_md, encoding="utf-8")
+        logger.info("Merged markdown saved to: %s", merged_path)
+
+    rendered_html = _render_merged(merged_md)
     html_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page}_rendered.html"
     html_path.write_text(rendered_html, encoding="utf-8")
     logger.info("Rendered HTML saved to: %s", html_path)
@@ -189,6 +196,7 @@ async def _parse_sse_generator(
             "total_pages": total_pages,
             "structure_markdown": md,
             "vlm_markdown": vlm_md,
+            "merged_markdown": merged_md,
             "rendered_html": rendered_html,
             "ocr_elapsed_s": ocr_result["elapsed_s"],
             "total_elapsed_s": round(elapsed, 1),
@@ -229,39 +237,12 @@ async def parse_document(
     )
 
 
-def _render_from_ocr(ocr_result: dict) -> str:
-    """Build styled HTML from OCR output.
-
-    Uses VLM markdown as primary source (better table structure and numbers),
-    falls back to PP-StructureV3 tables only when VLM is unavailable.
-    """
-    vlm = ocr_result.get("vlm") or {}
-    vlm_md: str = vlm.get("markdown", "")
-    structure = ocr_result.get("structure", {})
-    structure_md: str = structure.get("markdown", "")
-
-    # VLM markdown contains proper HTML tables inline — use it directly
-    if vlm_md:
-        body_html = _vlm_markdown_to_html(vlm_md)
+def _render_merged(merged_md: str) -> str:
+    """Build styled HTML from merged markdown (headings + inline HTML tables)."""
+    if not merged_md:
+        body_html = '<p style="text-align:center;color:#888">No OCR output</p>'
     else:
-        # Fallback: use PP-StructureV3 tables
-        tables: list[dict] = structure.get("tables", [])
-        table_htmls = [t["html"] for t in tables if t.get("html")]
-        if table_htmls:
-            sections = []
-            for i, raw_html in enumerate(table_htmls):
-                styled = _enhance_table_html(raw_html)
-                label = f"Table {i + 1}" if len(table_htmls) > 1 else ""
-                section = '<div class="table-section">'
-                if label:
-                    section += f'<div class="section-label">{label}</div>'
-                section += styled + "</div>"
-                sections.append(section)
-            body_html = "\n".join(sections)
-        elif structure_md:
-            body_html = f'<div class="table-section"><pre>{_esc(structure_md)}</pre></div>'
-        else:
-            body_html = '<p style="text-align:center;color:#888">No OCR output</p>'
+        body_html = _vlm_markdown_to_html(merged_md)
 
     return f"""<!DOCTYPE html>
 <html lang="ko">
