@@ -17,7 +17,7 @@ echo "=== Starting vLLM server for PaddleOCR-VL-1.5 on port $VLM_PORT ==="
 vllm serve PaddlePaddle/PaddleOCR-VL-1.5 \
     --port "$VLM_PORT" \
     --dtype bfloat16 \
-    --max-model-len 4096 \
+    --max-model-len 8192 \
     --gpu-memory-utilization 0.3 \
     --trust-remote-code &
 
