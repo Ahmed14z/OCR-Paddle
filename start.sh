@@ -1,24 +1,28 @@
 #!/bin/bash
 # Start vLLM server for PaddleOCR-VL, then launch the FastAPI app.
-# Usage: bash start.sh
+#
+# vLLM runs system-wide (uses system PyTorch from RunPod image).
+# The FastAPI app runs in the uv venv and connects via HTTP.
 #
 # First-time setup on RunPod:
-#   paddleocr install_genai_server_deps vllm
+#   pip install vllm
 #
-# This installs vLLM 0.10.2 with compatible CUDA libs.
-# Do NOT add vLLM to pyproject.toml — it conflicts with PaddlePaddle GPU.
+# Usage: bash start.sh
 
 set -e
 
 VLM_PORT="${VLM_SERVER_PORT:-8080}"
 
-# Check if vLLM deps are installed
+# Check if vLLM is available system-wide
 if ! python3 -c "import vllm" 2>/dev/null; then
-    echo "=== vLLM not found. Installing genai_server deps... ==="
-    paddleocr install_genai_server_deps vllm
+    echo "=== vLLM not found. Installing system-wide... ==="
+    pip install vllm
 fi
 
 echo "=== Starting vLLM server for PaddleOCR-VL-1.5 on port $VLM_PORT ==="
+
+# Use system python (not uv run) for the vLLM server
+PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
 paddleocr genai_server \
     --model_name PaddleOCR-VL-1.5-0.9B \
     --backend vllm \
@@ -30,7 +34,7 @@ echo "vLLM server PID: $VLM_PID"
 # Cleanup on exit
 trap "kill $VLM_PID 2>/dev/null; wait $VLM_PID 2>/dev/null" EXIT
 
-# Wait for vLLM server to be ready (may take 30-90s to load model)
+# Wait for vLLM server to be ready (model loading takes 30-90s)
 echo "Waiting for vLLM server to start (this may take a minute)..."
 for i in $(seq 1 120); do
     if curl -s "http://127.0.0.1:$VLM_PORT/v1/models" > /dev/null 2>&1; then
