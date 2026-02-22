@@ -226,13 +226,45 @@ async def _process_single_page(
             original_html = unified["vlm_html"]
             corrected_md = corrected_md.replace(original_html, rebuilt_html, 1)
 
-    # Non-table Korean text correction
+    # Non-table Korean text correction — only send prose, skip HTML tables
     if corrected_md and settings.openrouter_api_key:
-        logger.info("=== Non-table text correction: %d chars of markdown ===", len(corrected_md))
-        yield _sse_event({"status": "correcting_text"})
-        t_text = time.time()
-        corrected_md = await correct_ocr_text(corrected_md)
-        logger.info("Non-table text correction done in %.1fs", time.time() - t_text)
+        # Extract non-table lines for correction (tables already corrected above)
+        lines = corrected_md.split("\n")
+        non_table_lines: list[str] = []
+        table_map: dict[int, str] = {}  # line_index -> original table HTML
+        for i, line in enumerate(lines):
+            if "<table" in line:
+                table_map[i] = line
+                non_table_lines.append(f"__TABLE_PLACEHOLDER_{i}__")
+            else:
+                non_table_lines.append(line)
+
+        prose_text = "\n".join(non_table_lines)
+
+        if prose_text.strip() and any(c not in " \n_" for c in prose_text.replace("__TABLE_PLACEHOLDER_", "")):
+            logger.info("=== Non-table text correction: %d chars (stripped from %d) ===",
+                        len(prose_text), len(corrected_md))
+            yield _sse_event({"status": "correcting_text"})
+            t_text = time.time()
+            corrected_prose = await correct_ocr_text(prose_text)
+            logger.info("Non-table text correction done in %.1fs", time.time() - t_text)
+
+            # Re-insert table HTML at placeholder positions
+            result_lines = corrected_prose.split("\n")
+            final_lines: list[str] = []
+            for line in result_lines:
+                replaced = False
+                for idx, table_html in table_map.items():
+                    placeholder = f"__TABLE_PLACEHOLDER_{idx}__"
+                    if placeholder in line:
+                        final_lines.append(table_html)
+                        replaced = True
+                        break
+                if not replaced:
+                    final_lines.append(line)
+            corrected_md = "\n".join(final_lines)
+        else:
+            logger.info("No non-table prose to correct, skipping LLM text call")
 
     if corrected_md != primary_md:
         corrected_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page_idx}_corrected.md"
