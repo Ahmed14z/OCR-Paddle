@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     allowed_origins: list[str] = ["*"]
     ocr_device: str = "gpu:0"
     ocr_lang: str = "korean"
-    pdf_dpi: int = 72  # PaddleOCR benchmarks use 72 DPI; models resize internally anyway
+    pdf_dpi: int = 200  # 200 DPI balances Structure accuracy (needs readable Korean chars) with VLM speed
     vlm_max_pixels: int = 1003520  # 1280*28*28, official recommendation for OCR/table tasks
     openrouter_api_key: str = ""
     openrouter_model: str = "qwen/qwen3-8b"
