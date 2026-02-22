@@ -239,13 +239,16 @@ async def _process_single_page(
             original_html = unified["vlm_html"]
             corrected_md = corrected_md.replace(original_html, rebuilt_html, 1)
 
-    # Non-table Korean text correction
-    print(f">>> ENTERING non-table text correction. corrected_md={len(corrected_md) if corrected_md else 0} chars, api_key={'set' if settings.openrouter_api_key else 'NOT SET'}", flush=True)
-    if corrected_md and settings.openrouter_api_key:
-        yield _sse_event({"status": "correcting_text"})
-        t_text = time.time()
-        corrected_md = await correct_ocr_text(corrected_md)
-        print(f">>> Non-table text correction done in {time.time() - t_text:.1f}s", flush=True)
+    # TODO: Non-table Korean text correction — disabled for now.
+    # Sending full markdown (with HTML tables) to the LLM risks breaking
+    # table layout (dropped tags, changed rowspans). Re-enable once we
+    # implement prose-only splitting that strips tables before sending.
+    # if corrected_md and settings.openrouter_api_key:
+    #     yield _sse_event({"status": "correcting_text"})
+    #     t_text = time.time()
+    #     corrected_md = await correct_ocr_text(corrected_md)
+    #     print(f">>> Non-table text correction done in {time.time() - t_text:.1f}s", flush=True)
+    print(">>> Non-table text correction SKIPPED (disabled to protect layout)", flush=True)
 
     if corrected_md != primary_md:
         corrected_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page_idx}_corrected.md"

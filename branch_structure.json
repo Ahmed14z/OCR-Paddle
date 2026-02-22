@@ -1,0 +1,15 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "feat/llm-table-arbitration",
+    "main"
+  ],
+  "parent": {
+    "feat/llm-table-arbitration": "main",
+    "main": null
+  },
+  "order": [
+    "main",
+    "feat/llm-table-arbitration"
+  ]
+}
