@@ -21,9 +21,10 @@ fi
 
 echo "=== Starting vLLM server for PaddleOCR-VL-1.5 on port $VLM_PORT ==="
 
-# Use system python (not uv run) for the vLLM server
+# paddleocr CLI lives in the uv venv, but vLLM is system-wide.
+# Use uv run to find paddleocr, vLLM gets picked up from system site-packages.
 PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
-paddleocr genai_server \
+uv run paddleocr genai_server \
     --model_name PaddleOCR-VL-1.5-0.9B \
     --backend vllm \
     --port "$VLM_PORT" &
