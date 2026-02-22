@@ -121,6 +121,10 @@ async def _process_single_page(
                 yield _sse_event(msg)
 
     ocr_elapsed = round(time.time() - t0, 1)
+    logger.info(">>> OCR engines done in %.1fs. structure=%s, vlm=%s",
+                ocr_elapsed,
+                "OK" if structure_result else "NONE",
+                "OK" if vlm_result else "NONE")
     ocr_result: dict[str, Any] = {
         "structure": structure_result,
         "vlm": vlm_result,
@@ -148,11 +152,15 @@ async def _process_single_page(
             logger.info("VLM markdown saved to: %s", vlm_path)
 
     # -- Table alignment + LLM correction pipeline --
+    logger.info(">>> ENTERING table alignment pipeline")
     primary_md = vlm_md or md
     corrected_md = primary_md
+    logger.info(">>> primary_md source=%s, length=%d chars",
+                "vlm" if vlm_md else "structure", len(primary_md))
 
     struct_tables = ocr_result["structure"].get("tables", [])
     text_blocks = ocr_result["structure"].get("text_blocks", [])
+    logger.info(">>> struct_tables=%d, text_blocks=%d", len(struct_tables), len(text_blocks))
 
     unified_tables: list[dict[str, Any]] = []
 
@@ -161,10 +169,11 @@ async def _process_single_page(
         logger.info("=== Table alignment: %d struct tables, vlm_md=%d chars ===",
                      len(struct_tables), len(vlm_md))
 
+        t_align = time.time()
         vlm_tables_parsed = parse_vlm_tables(vlm_md)
-        logger.info("Parsed %d VLM tables from markdown", len(vlm_tables_parsed))
+        logger.info(">>> Parsed %d VLM tables from markdown", len(vlm_tables_parsed))
         pairs = match_tables(vlm_tables_parsed, struct_tables)
-        logger.info("Table matching pairs: %s", pairs)
+        logger.info(">>> Table matching pairs: %s", pairs)
 
         # Build UnifiedTable for each matched pair
         for vlm_idx, struct_idx in pairs:
@@ -185,9 +194,13 @@ async def _process_single_page(
             if any(c["needs_llm"] for c in t["cells"])
         ]
 
+        logger.info(">>> Alignment done in %.1fs. %d tables need LLM, api_key=%s",
+                    time.time() - t_align, len(tables_needing_llm),
+                    "set" if settings.openrouter_api_key else "NOT SET")
+
         if tables_needing_llm and settings.openrouter_api_key:
             n_total = len(tables_needing_llm)
-            logger.info("Sending %d tables with ambiguous cells to LLM...", n_total)
+            logger.info(">>> Sending %d tables with ambiguous cells to LLM...", n_total)
 
             yield _sse_event({
                 "status": "correcting_tables",
@@ -221,12 +234,16 @@ async def _process_single_page(
                 _save_json(all_corrections, ts, safe_name, page_idx, "llm_corrections")
 
         # Rebuild HTML for all unified tables
+        logger.info(">>> Rebuilding HTML for %d unified tables", len(unified_tables))
         for unified in unified_tables:
             rebuilt_html = rebuild_table_html(unified)
             original_html = unified["vlm_html"]
             corrected_md = corrected_md.replace(original_html, rebuilt_html, 1)
 
     # Non-table Korean text correction — only send prose, skip HTML tables
+    logger.info(">>> ENTERING non-table text correction. corrected_md=%d chars, api_key=%s",
+                len(corrected_md) if corrected_md else 0,
+                "set" if settings.openrouter_api_key else "NOT SET")
     if corrected_md and settings.openrouter_api_key:
         # Extract non-table lines for correction (tables already corrected above)
         lines = corrected_md.split("\n")
