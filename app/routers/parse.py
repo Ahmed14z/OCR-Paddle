@@ -93,10 +93,11 @@ async def _process_single_page(
     Yields SSE event strings for progress, and a final dict with key
     ``"_page_result"`` containing the per-page output.
     """
-    logger.info("Image shape: %s", image.shape)
+    logger.info(">>> _process_single_page ENTERED. shape=%s page=%d", image.shape, page_idx)
     _save_source(image, ts, safe_name, page_idx)
 
     # -- Structure OCR --
+    logger.info(">>> Starting Structure OCR...")
     yield _sse_event({"status": "running_structure_ocr"})
     structure_result: dict[str, Any] | None = None
     async for msg in _run_in_thread_with_heartbeats(
@@ -107,10 +108,12 @@ async def _process_single_page(
         else:
             yield _sse_event(msg)
     assert structure_result is not None
+    logger.info(">>> Structure OCR DONE")
 
     # -- VLM OCR --
     vlm_result: dict[str, Any] | None = None
     if engine.vlm:
+        logger.info(">>> Starting VLM OCR...")
         yield _sse_event({"status": "running_vlm"})
         async for msg in _run_in_thread_with_heartbeats(
             engine._run_vlm, image, status_label="running_vlm",
@@ -240,48 +243,15 @@ async def _process_single_page(
             original_html = unified["vlm_html"]
             corrected_md = corrected_md.replace(original_html, rebuilt_html, 1)
 
-    # Non-table Korean text correction — only send prose, skip HTML tables
+    # Non-table Korean text correction
     logger.info(">>> ENTERING non-table text correction. corrected_md=%d chars, api_key=%s",
                 len(corrected_md) if corrected_md else 0,
                 "set" if settings.openrouter_api_key else "NOT SET")
     if corrected_md and settings.openrouter_api_key:
-        # Extract non-table lines for correction (tables already corrected above)
-        lines = corrected_md.split("\n")
-        non_table_lines: list[str] = []
-        table_map: dict[int, str] = {}  # line_index -> original table HTML
-        for i, line in enumerate(lines):
-            if "<table" in line:
-                table_map[i] = line
-                non_table_lines.append(f"__TABLE_PLACEHOLDER_{i}__")
-            else:
-                non_table_lines.append(line)
-
-        prose_text = "\n".join(non_table_lines)
-
-        if prose_text.strip() and any(c not in " \n_" for c in prose_text.replace("__TABLE_PLACEHOLDER_", "")):
-            logger.info("=== Non-table text correction: %d chars (stripped from %d) ===",
-                        len(prose_text), len(corrected_md))
-            yield _sse_event({"status": "correcting_text"})
-            t_text = time.time()
-            corrected_prose = await correct_ocr_text(prose_text)
-            logger.info("Non-table text correction done in %.1fs", time.time() - t_text)
-
-            # Re-insert table HTML at placeholder positions
-            result_lines = corrected_prose.split("\n")
-            final_lines: list[str] = []
-            for line in result_lines:
-                replaced = False
-                for idx, table_html in table_map.items():
-                    placeholder = f"__TABLE_PLACEHOLDER_{idx}__"
-                    if placeholder in line:
-                        final_lines.append(table_html)
-                        replaced = True
-                        break
-                if not replaced:
-                    final_lines.append(line)
-            corrected_md = "\n".join(final_lines)
-        else:
-            logger.info("No non-table prose to correct, skipping LLM text call")
+        yield _sse_event({"status": "correcting_text"})
+        t_text = time.time()
+        corrected_md = await correct_ocr_text(corrected_md)
+        logger.info(">>> Non-table text correction done in %.1fs", time.time() - t_text)
 
     if corrected_md != primary_md:
         corrected_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page_idx}_corrected.md"
