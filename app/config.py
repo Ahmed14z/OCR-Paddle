@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     vlm_max_pixels: int = 1605632  # 2048*28*28, higher res for Korean chars
     openrouter_api_key: str = ""
     openrouter_model: str = "qwen/qwen3-8b"
+    table_correction_model: str = "qwen/qwen3-8b"
+    table_correction_timeout: int = 30
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

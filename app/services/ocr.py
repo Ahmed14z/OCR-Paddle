@@ -35,7 +35,7 @@ class OCREngine:
         self.structure = PPStructureV3(
             text_recognition_model_name="korean_PP-OCRv5_mobile_rec",
             use_table_recognition=True,
-            use_doc_orientation_classify=True,
+            use_doc_orientation_classify=False,
             use_region_detection=True,
             use_doc_unwarping=False,
             use_formula_recognition=False,
@@ -45,6 +45,20 @@ class OCREngine:
             device=settings.ocr_device,
         )
         logger.info("PP-StructureV3 ready in %.1fs", time.time() - t0)
+
+        # Workaround: PaddleX loads Chart2Table model unconditionally even when
+        # use_chart_recognition=False is set. Free it to reclaim GPU memory.
+        try:
+            pipeline = self.structure.paddlex_pipeline._pipeline
+            if (
+                hasattr(pipeline, "chart_recognition_model")
+                and pipeline.chart_recognition_model is not None
+            ):
+                pipeline.chart_recognition_model.close()
+                pipeline.chart_recognition_model = None
+                logger.info("Freed Chart2Table model (chart recognition disabled)")
+        except AttributeError:
+            logger.debug("Could not access Chart2Table model for cleanup")
 
         # PaddleOCR-VL will be initialized here when available
         self.vlm = None

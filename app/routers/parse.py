@@ -13,9 +13,17 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
-from app.services.llm_correct import correct_ocr_text
+from app.services.llm_correct import correct_ocr_text, correct_table_cells
 from app.services.ocr import OCREngine
 from app.services.pdf import image_bytes_to_numpy, pdf_pages_to_images
+from app.services.table_align import (
+    apply_llm_corrections,
+    build_unified_table,
+    format_cells_for_llm,
+    match_tables,
+    parse_vlm_tables,
+    rebuild_table_html,
+)
 
 logger = logging.getLogger("ocr.parse")
 router = APIRouter()
@@ -139,19 +147,90 @@ async def _process_single_page(
             vlm_path.write_text(vlm_md, encoding="utf-8")
             logger.info("VLM markdown saved to: %s", vlm_path)
 
-    # -- LLM post-correction for Korean character errors --
+    # -- Table alignment + LLM correction pipeline --
     primary_md = vlm_md or md
     corrected_md = primary_md
-    if primary_md and settings.openrouter_api_key:
-        yield _sse_event({"status": "correcting_korean"})
-        corrected_md = await correct_ocr_text(primary_md)
-        if corrected_md != primary_md:
-            corrected_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page_idx}_corrected.md"
-            corrected_path.write_text(corrected_md, encoding="utf-8")
-            logger.info("LLM-corrected markdown saved to: %s", corrected_path)
 
     struct_tables = ocr_result["structure"].get("tables", [])
     text_blocks = ocr_result["structure"].get("text_blocks", [])
+
+    unified_tables: list[dict[str, Any]] = []
+
+    if vlm_md:
+        yield _sse_event({"status": "aligning_tables"})
+
+        vlm_tables_parsed = parse_vlm_tables(vlm_md)
+        pairs = match_tables(vlm_tables_parsed, struct_tables)
+
+        # Build UnifiedTable for each matched pair
+        for vlm_idx, struct_idx in pairs:
+            vlm_html, vlm_cells = vlm_tables_parsed[vlm_idx]
+            struct_data = struct_tables[struct_idx] if struct_idx is not None else None
+            unified = build_unified_table(vlm_html, vlm_cells, struct_data, vlm_idx)
+            unified_tables.append(unified)
+
+        # Save unified tables for debugging
+        _save_json(
+            {"tables": unified_tables},
+            ts, safe_name, page_idx, "unified_tables",
+        )
+
+        # LLM correction for ambiguous cells
+        tables_needing_llm = [
+            (i, t) for i, t in enumerate(unified_tables)
+            if any(c["needs_llm"] for c in t["cells"])
+        ]
+
+        if tables_needing_llm and settings.openrouter_api_key:
+            n_total = len(tables_needing_llm)
+            logger.info("Sending %d tables with ambiguous cells to LLM...", n_total)
+
+            yield _sse_event({
+                "status": "correcting_tables",
+                "table": 0,
+                "total": n_total,
+            })
+
+            async def _correct_one_table(
+                idx: int, table: dict[str, Any],
+            ) -> tuple[int, list[dict[str, Any]]]:
+                prompt = format_cells_for_llm(table)
+                if not prompt:
+                    return idx, []
+                corrections = await correct_table_cells(prompt, table["table_idx"])
+                return idx, corrections
+
+            tasks = [_correct_one_table(idx, t) for idx, t in tables_needing_llm]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            all_corrections: dict[str, list[dict[str, Any]]] = {}
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error("Table correction task failed: %s", result)
+                    continue
+                idx, corrections = result
+                if corrections:
+                    all_corrections[str(idx)] = corrections
+                    apply_llm_corrections(unified_tables[idx], corrections)
+
+            if all_corrections:
+                _save_json(all_corrections, ts, safe_name, page_idx, "llm_corrections")
+
+        # Rebuild HTML for all unified tables
+        for unified in unified_tables:
+            rebuilt_html = rebuild_table_html(unified)
+            original_html = unified["vlm_html"]
+            corrected_md = corrected_md.replace(original_html, rebuilt_html, 1)
+
+    # Non-table Korean text correction
+    if corrected_md and settings.openrouter_api_key:
+        yield _sse_event({"status": "correcting_text"})
+        corrected_md = await correct_ocr_text(corrected_md)
+
+    if corrected_md != primary_md:
+        corrected_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page_idx}_corrected.md"
+        corrected_path.write_text(corrected_md, encoding="utf-8")
+        logger.info("LLM-corrected markdown saved to: %s", corrected_path)
 
     yield {
         "_page_result": {
