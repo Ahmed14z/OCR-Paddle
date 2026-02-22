@@ -93,11 +93,11 @@ async def _process_single_page(
     Yields SSE event strings for progress, and a final dict with key
     ``"_page_result"`` containing the per-page output.
     """
-    logger.info(">>> _process_single_page ENTERED. shape=%s page=%d", image.shape, page_idx)
+    print(f">>> _process_single_page ENTERED. shape={image.shape} page={page_idx}", flush=True)
     _save_source(image, ts, safe_name, page_idx)
 
     # -- Structure OCR --
-    logger.info(">>> Starting Structure OCR...")
+    print(">>> Starting Structure OCR...", flush=True)
     yield _sse_event({"status": "running_structure_ocr"})
     structure_result: dict[str, Any] | None = None
     async for msg in _run_in_thread_with_heartbeats(
@@ -108,12 +108,12 @@ async def _process_single_page(
         else:
             yield _sse_event(msg)
     assert structure_result is not None
-    logger.info(">>> Structure OCR DONE")
+    print(">>> Structure OCR DONE", flush=True)
 
     # -- VLM OCR --
     vlm_result: dict[str, Any] | None = None
     if engine.vlm:
-        logger.info(">>> Starting VLM OCR...")
+        print(">>> Starting VLM OCR...", flush=True)
         yield _sse_event({"status": "running_vlm"})
         async for msg in _run_in_thread_with_heartbeats(
             engine._run_vlm, image, status_label="running_vlm",
@@ -124,10 +124,7 @@ async def _process_single_page(
                 yield _sse_event(msg)
 
     ocr_elapsed = round(time.time() - t0, 1)
-    logger.info(">>> OCR engines done in %.1fs. structure=%s, vlm=%s",
-                ocr_elapsed,
-                "OK" if structure_result else "NONE",
-                "OK" if vlm_result else "NONE")
+    print(f">>> OCR engines done in {ocr_elapsed}s. structure={'OK' if structure_result else 'NONE'}, vlm={'OK' if vlm_result else 'NONE'}", flush=True)
     ocr_result: dict[str, Any] = {
         "structure": structure_result,
         "vlm": vlm_result,
@@ -155,15 +152,14 @@ async def _process_single_page(
             logger.info("VLM markdown saved to: %s", vlm_path)
 
     # -- Table alignment + LLM correction pipeline --
-    logger.info(">>> ENTERING table alignment pipeline")
+    print(">>> ENTERING table alignment pipeline", flush=True)
     primary_md = vlm_md or md
     corrected_md = primary_md
-    logger.info(">>> primary_md source=%s, length=%d chars",
-                "vlm" if vlm_md else "structure", len(primary_md))
+    print(f">>> primary_md source={'vlm' if vlm_md else 'structure'}, length={len(primary_md)} chars", flush=True)
 
     struct_tables = ocr_result["structure"].get("tables", [])
     text_blocks = ocr_result["structure"].get("text_blocks", [])
-    logger.info(">>> struct_tables=%d, text_blocks=%d", len(struct_tables), len(text_blocks))
+    print(f">>> struct_tables={len(struct_tables)}, text_blocks={len(text_blocks)}", flush=True)
 
     unified_tables: list[dict[str, Any]] = []
 
@@ -244,14 +240,12 @@ async def _process_single_page(
             corrected_md = corrected_md.replace(original_html, rebuilt_html, 1)
 
     # Non-table Korean text correction
-    logger.info(">>> ENTERING non-table text correction. corrected_md=%d chars, api_key=%s",
-                len(corrected_md) if corrected_md else 0,
-                "set" if settings.openrouter_api_key else "NOT SET")
+    print(f">>> ENTERING non-table text correction. corrected_md={len(corrected_md) if corrected_md else 0} chars, api_key={'set' if settings.openrouter_api_key else 'NOT SET'}", flush=True)
     if corrected_md and settings.openrouter_api_key:
         yield _sse_event({"status": "correcting_text"})
         t_text = time.time()
         corrected_md = await correct_ocr_text(corrected_md)
-        logger.info(">>> Non-table text correction done in %.1fs", time.time() - t_text)
+        print(f">>> Non-table text correction done in {time.time() - t_text:.1f}s", flush=True)
 
     if corrected_md != primary_md:
         corrected_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page_idx}_corrected.md"
