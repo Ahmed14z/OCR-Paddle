@@ -46,6 +46,13 @@ async def correct_ocr_text(ocr_markdown: str) -> str:
         settings.openrouter_model, key_preview, len(ocr_markdown),
     )
 
+    t0 = time.time()
+    max_tokens = min(len(ocr_markdown) * 2, 16000)
+    logger.info(
+        "correct_ocr_text: payload %d chars, max_tokens=%d, timeout=60s",
+        len(ocr_markdown), max_tokens,
+    )
+
     try:
         payload = {
             "model": settings.openrouter_model,
@@ -54,9 +61,10 @@ async def correct_ocr_text(ocr_markdown: str) -> str:
                 {"role": "user", "content": ocr_markdown},
             ],
             "temperature": 0.0,
-            "max_tokens": min(len(ocr_markdown) * 2, 16000),
+            "max_tokens": max_tokens,
         }
 
+        logger.info("correct_ocr_text: sending request to OpenRouter...")
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -66,22 +74,42 @@ async def correct_ocr_text(ocr_markdown: str) -> str:
                 },
                 json=payload,
             )
+            elapsed = time.time() - t0
+            logger.info(
+                "correct_ocr_text: got response status=%d in %.1fs",
+                resp.status_code, elapsed,
+            )
             if resp.status_code != 200:
                 logger.error("LLM API error %d: %s", resp.status_code, resp.text[:500])
             resp.raise_for_status()
 
         data: dict[str, Any] = resp.json()
+        usage = data.get("usage", {})
+        logger.info(
+            "correct_ocr_text: tokens used — prompt=%s, completion=%s, total=%s",
+            usage.get("prompt_tokens", "?"),
+            usage.get("completion_tokens", "?"),
+            usage.get("total_tokens", "?"),
+        )
         corrected = data["choices"][0]["message"]["content"]
 
         if not corrected or not corrected.strip():
             logger.warning("LLM returned empty response — using original")
             return ocr_markdown
 
-        logger.info("LLM correction done (%d → %d chars)", len(ocr_markdown), len(corrected))
+        elapsed = time.time() - t0
+        logger.info(
+            "correct_ocr_text: done in %.1fs (%d → %d chars)",
+            elapsed, len(ocr_markdown), len(corrected),
+        )
         return corrected
 
     except Exception as e:
-        logger.error("LLM correction failed: %s — using original", e)
+        elapsed = time.time() - t0
+        logger.error(
+            "correct_ocr_text: failed after %.1fs: %s — using original",
+            elapsed, e,
+        )
         return ocr_markdown
 
 
