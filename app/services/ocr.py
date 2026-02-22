@@ -65,14 +65,27 @@ class OCREngine:
         self._try_init_vlm()
 
     def _try_init_vlm(self) -> None:
-        """Try to initialize PaddleOCR-VL-1.5 (optional, GPU-heavy)."""
+        """Try to initialize PaddleOCR-VL-1.5 with vLLM backend for fast inference."""
         try:
             from paddleocr import PaddleOCRVL
 
-            logger.info("Initializing PaddleOCR-VL-1.5...")
+            backend = settings.vlm_backend
+            logger.info("Initializing PaddleOCR-VL-1.5 (backend=%s)...", backend)
             t0 = time.time()
-            self.vlm = PaddleOCRVL(device=settings.ocr_device, use_queues=False)
-            logger.info("PaddleOCR-VL-1.5 ready in %.1fs", time.time() - t0)
+
+            if backend == "vllm-server":
+                self.vlm = PaddleOCRVL(
+                    vl_rec_backend="vllm-server",
+                    vl_rec_server_url=settings.vlm_server_url,
+                    use_queues=False,
+                )
+                logger.info(
+                    "PaddleOCR-VL-1.5 ready in %.1fs (vLLM server at %s)",
+                    time.time() - t0, settings.vlm_server_url,
+                )
+            else:
+                self.vlm = PaddleOCRVL(device=settings.ocr_device, use_queues=False)
+                logger.info("PaddleOCR-VL-1.5 ready in %.1fs (local)", time.time() - t0)
         except (ImportError, Exception) as e:
             logger.warning("PaddleOCR-VL not available: %s — using PP-StructureV3 only", e)
             self.vlm = None

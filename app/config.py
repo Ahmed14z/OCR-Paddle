@@ -8,6 +8,9 @@ class Settings(BaseSettings):
     ocr_lang: str = "korean"
     pdf_dpi: int = 200  # 200 DPI balances Structure accuracy (needs readable Korean chars) with VLM speed
     vlm_max_pixels: int = 1003520  # 1280*28*28, official recommendation for OCR/table tasks
+    vlm_backend: str = "vllm-server"  # "vllm-server" for fast inference, "local" for PaddlePaddle native
+    vlm_server_url: str = "http://127.0.0.1:8080/v1"
+    vlm_server_port: int = 8080
     openrouter_api_key: str = ""
     openrouter_model: str = "qwen/qwen3-8b"
     table_correction_model: str = "qwen/qwen3-8b"
