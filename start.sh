@@ -18,7 +18,8 @@ vllm serve PaddlePaddle/PaddleOCR-VL-1.5 \
     --port "$VLM_PORT" \
     --dtype bfloat16 \
     --max-model-len 4096 \
-    --gpu-memory-utilization 0.3 &
+    --gpu-memory-utilization 0.3 \
+    --trust-remote-code &
 
 VLM_PID=$!
 echo "vLLM server PID: $VLM_PID"
