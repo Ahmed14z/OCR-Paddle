@@ -65,30 +65,25 @@ class OCREngine:
         self._try_init_vlm()
 
     def _try_init_vlm(self) -> None:
-        """Try to initialize PaddleOCR-VL-1.5 with vLLM backend for fast inference."""
-        try:
-            from paddleocr import PaddleOCRVL
+        """Initialize VLM — either via vLLM server (fast) or local PaddlePaddle (slow)."""
+        self._vlm_backend = settings.vlm_backend
+        logger.info("VLM backend: %s", self._vlm_backend)
 
-            backend = settings.vlm_backend
-            logger.info("Initializing PaddleOCR-VL-1.5 (backend=%s)...", backend)
-            t0 = time.time()
+        if self._vlm_backend == "vllm-server":
+            # vLLM server runs separately — just mark as ready, no model to load here
+            self.vlm = True  # sentinel: VLM is available via HTTP
+            logger.info("VLM configured for vLLM server at %s", settings.vlm_server_url)
+        else:
+            try:
+                from paddleocr import PaddleOCRVL
 
-            if backend == "vllm-server":
-                self.vlm = PaddleOCRVL(
-                    vl_rec_backend="vllm-server",
-                    vl_rec_server_url=settings.vlm_server_url,
-                    use_queues=False,
-                )
-                logger.info(
-                    "PaddleOCR-VL-1.5 ready in %.1fs (vLLM server at %s)",
-                    time.time() - t0, settings.vlm_server_url,
-                )
-            else:
+                logger.info("Initializing PaddleOCR-VL-1.5 (local)...")
+                t0 = time.time()
                 self.vlm = PaddleOCRVL(device=settings.ocr_device, use_queues=False)
                 logger.info("PaddleOCR-VL-1.5 ready in %.1fs (local)", time.time() - t0)
-        except (ImportError, Exception) as e:
-            logger.warning("PaddleOCR-VL not available: %s — using PP-StructureV3 only", e)
-            self.vlm = None
+            except (ImportError, Exception) as e:
+                logger.warning("PaddleOCR-VL not available: %s — using PP-StructureV3 only", e)
+                self.vlm = None
 
     def extract(self, image: np.ndarray) -> dict[str, Any]:
         """Run dual OCR on an image and return merged results."""
@@ -172,13 +167,74 @@ class OCREngine:
         if not self.vlm:
             return None
 
-        logger.info("Running PaddleOCR-VL-1.5...")
+        if self._vlm_backend == "vllm-server":
+            return self._run_vlm_vllm(image)
+        return self._run_vlm_local(image)
+
+    def _run_vlm_vllm(self, image: np.ndarray) -> dict[str, Any] | None:
+        """Call PaddleOCR-VL-1.5 via vLLM's OpenAI-compatible API."""
+        import base64
+        import io
+        import json as json_mod
+
+        import httpx
+        from PIL import Image
+
+        logger.info("Running PaddleOCR-VL via vLLM server...")
         t0 = time.time()
 
         try:
-            # Save to temp file — VL's internal preprocessing has numpy 2.x
-            # scalar conversion issues when receiving arrays directly
+            # Encode image as base64 data URL
+            img = Image.fromarray(image)
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            data_url = f"data:image/png;base64,{b64}"
+
+            payload = {
+                "model": "PaddlePaddle/PaddleOCR-VL-1.5",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": data_url}},
+                            {"type": "text", "text": "Render the text in this image to Markdown."},
+                        ],
+                    }
+                ],
+                "max_tokens": 4096,
+                "temperature": 0.0,
+            }
+
+            resp = httpx.post(
+                f"{settings.vlm_server_url}/chat/completions",
+                json=payload,
+                timeout=120.0,
+            )
+
+            if resp.status_code != 200:
+                logger.error("vLLM API error %d: %s", resp.status_code, resp.text[:500])
+                return None
+
+            data = resp.json()
+            markdown = data["choices"][0]["message"]["content"]
+
+            elapsed = time.time() - t0
+            logger.info("PaddleOCR-VL (vLLM): %.1fs, %d chars", elapsed, len(markdown))
+            return {"markdown": markdown}
+
+        except Exception as e:
+            logger.error("PaddleOCR-VL (vLLM) failed: %s", e)
+            return None
+
+    def _run_vlm_local(self, image: np.ndarray) -> dict[str, Any] | None:
+        """Run PaddleOCR-VL-1.5 locally via PaddlePaddle (slow, no attention optimization)."""
+        logger.info("Running PaddleOCR-VL-1.5 (local)...")
+        t0 = time.time()
+
+        try:
             import tempfile
+
             from PIL import Image
 
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
@@ -204,8 +260,8 @@ class OCREngine:
                 else:
                     markdown = ""
             elapsed = time.time() - t0
-            logger.info("PaddleOCR-VL: %.1fs", elapsed)
+            logger.info("PaddleOCR-VL (local): %.1fs", elapsed)
             return {"markdown": markdown}
         except Exception as e:
-            logger.error("PaddleOCR-VL failed: %s", e)
+            logger.error("PaddleOCR-VL (local) failed: %s", e)
             return None

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Start vLLM server for PaddleOCR-VL, then launch the FastAPI app.
 #
-# vLLM runs system-wide (uses system PyTorch from RunPod image).
+# vLLM runs with system Python/PyTorch (NOT in the uv venv).
 # The FastAPI app runs in the uv venv and connects via HTTP.
 #
 # First-time setup on RunPod:
@@ -13,21 +13,14 @@ set -e
 
 VLM_PORT="${VLM_SERVER_PORT:-8080}"
 
-# Check if vLLM is available system-wide
-if ! python3 -c "import vllm" 2>/dev/null; then
-    echo "=== vLLM not found. Installing system-wide... ==="
-    pip install vllm
-fi
-
 echo "=== Starting vLLM server for PaddleOCR-VL-1.5 on port $VLM_PORT ==="
 
-# paddleocr CLI lives in the uv venv, but vLLM is system-wide.
-# Use uv run to find paddleocr, vLLM gets picked up from system site-packages.
-PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
-uv run paddleocr genai_server \
-    --model_name PaddleOCR-VL-1.5-0.9B \
-    --backend vllm \
-    --port "$VLM_PORT" &
+# Run vLLM with system python — completely outside the uv venv
+vllm serve PaddlePaddle/PaddleOCR-VL-1.5 \
+    --port "$VLM_PORT" \
+    --dtype bfloat16 \
+    --max-model-len 4096 \
+    --gpu-memory-utilization 0.3 &
 
 VLM_PID=$!
 echo "vLLM server PID: $VLM_PID"
@@ -44,6 +37,10 @@ for i in $(seq 1 120); do
     fi
     if ! kill -0 $VLM_PID 2>/dev/null; then
         echo "ERROR: vLLM server process died. Check logs above."
+        echo ""
+        echo "If vLLM fails, you can still run without it:"
+        echo "  Add VLM_BACKEND=local to .env"
+        echo "  uv run poe serve"
         exit 1
     fi
     sleep 1
