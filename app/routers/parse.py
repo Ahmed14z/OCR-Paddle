@@ -158,9 +158,13 @@ async def _process_single_page(
 
     if vlm_md:
         yield _sse_event({"status": "aligning_tables"})
+        logger.info("=== Table alignment: %d struct tables, vlm_md=%d chars ===",
+                     len(struct_tables), len(vlm_md))
 
         vlm_tables_parsed = parse_vlm_tables(vlm_md)
+        logger.info("Parsed %d VLM tables from markdown", len(vlm_tables_parsed))
         pairs = match_tables(vlm_tables_parsed, struct_tables)
+        logger.info("Table matching pairs: %s", pairs)
 
         # Build UnifiedTable for each matched pair
         for vlm_idx, struct_idx in pairs:
@@ -224,8 +228,11 @@ async def _process_single_page(
 
     # Non-table Korean text correction
     if corrected_md and settings.openrouter_api_key:
+        logger.info("=== Non-table text correction: %d chars of markdown ===", len(corrected_md))
         yield _sse_event({"status": "correcting_text"})
+        t_text = time.time()
         corrected_md = await correct_ocr_text(corrected_md)
+        logger.info("Non-table text correction done in %.1fs", time.time() - t_text)
 
     if corrected_md != primary_md:
         corrected_path = OUTPUT_DIR / f"{ts}_{safe_name}_p{page_idx}_corrected.md"
